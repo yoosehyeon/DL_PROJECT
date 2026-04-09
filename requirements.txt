@@ -1,0 +1,25 @@
+# HybridPdM v2.1 - Python 3.10 기준 의존성
+# 설치: pip install -r requirements.txt
+
+# ── 딥러닝 코어 ────────────────────────────────────────────────
+torch>=2.0.0          # 모델 학습/추론 (1D-CNN, AE, BiLSTM)
+
+# ── 수치/데이터 처리 ──────────────────────────────────────────
+numpy>=1.23
+pandas>=1.5           # AI4I CSV, C-MAPSS txt 파싱
+scipy>=1.10           # CWRU .mat 파일 로드 (scipy.io)
+h5py>=3.8             # N-CMAPSS .h5 파일 로드
+
+# ── 머신러닝 유틸 ─────────────────────────────────────────────
+scikit-learn>=1.2     # train_test_split, StandardScaler, metrics
+
+# ── 모델 해석 (PRD §5) ────────────────────────────────────────
+captum>=0.7           # IntegratedGradients 기반 피처 중요도
+
+# ── 시각화 / 리포트 ───────────────────────────────────────────
+matplotlib>=3.6       # 학습 곡선, Risk Score 그래프
+tqdm>=4.65            # 학습 진행률 표시 (옵션)
+
+# ── 대시보드 / 배포 (PRD 기술스택) ────────────────────────────
+streamlit>=1.30       # PRD §6 대시보드 UI
+pyngrok>=7.0          # PRD ngrok 터널링 (Colab/원격 배포용)

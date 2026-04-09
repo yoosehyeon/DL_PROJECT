@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+artifacts/checkpoints/
+artifacts/reports/
+dataset/
+.env
