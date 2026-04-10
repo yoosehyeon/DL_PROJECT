@@ -1,7 +1,10 @@
 __pycache__/
 *.pyc
 *.pyo
-artifacts/checkpoints/
+# 타임스탬프 버전만 제외, canonical 파일은 포함
+artifacts/checkpoints/*_2026*.pt
+artifacts/checkpoints/*_2026*.json
+artifacts/checkpoints/*_2026*.pkl
 artifacts/reports/
 dataset/
 .env

@@ -1,0 +1,11 @@
+{
+  "name": "ai4i_gbdt",
+  "task": "gbdt_binary",
+  "n_train": 7000,
+  "n_pos_train": 237,
+  "n_neg_train": 6763,
+  "pos_weight": 28.535864978902953,
+  "val_logloss": 0.08851992372882811,
+  "best_val": 0.08851992372882811,
+  "best_epoch": 64
+}
