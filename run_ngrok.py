@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -41,10 +43,23 @@ def get_token(cli_token: str | None) -> str:
     return ""
 
 
+def find_free_port(start: int = 8501, end: int = 8600) -> int:
+    """start~end 범위에서 사용 가능한 포트를 반환."""
+    for port in range(start, end):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("localhost", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(f"포트 {start}~{end} 범위에서 사용 가능한 포트를 찾을 수 없습니다.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="HybridPdM ngrok 배포")
     parser.add_argument("--token",  default=None, help="ngrok authtoken")
-    parser.add_argument("--port",   type=int, default=8501, help="Streamlit 포트 (기본 8501)")
+    parser.add_argument("--port",   type=int, default=None, help="Streamlit 포트 (미지정 시 자동 탐색)")
     parser.add_argument("--region", default="jp", help="ngrok 리전 (기본 jp, 한국 인접)")
     args = parser.parse_args()
 
@@ -65,6 +80,18 @@ def main():
         print("[오류] pyngrok이 설치되지 않았습니다.\n  pip install pyngrok")
         sys.exit(1)
 
+    # ── 포트 결정 ──────────────────────────────────────────────────
+    if args.port:
+        port = args.port
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("localhost", port)) == 0:
+                print(f"[경고] 포트 {port}가 이미 사용 중입니다. 다른 포트를 자동 탐색합니다.")
+                port = find_free_port(port + 1)
+    else:
+        port = find_free_port()
+
+    print(f"[포트] {port} 사용")
+
     # ── ngrok 설정 ─────────────────────────────────────────────────
     conf.get_default().region = args.region
     ngrok.set_auth_token(token)
@@ -73,24 +100,39 @@ def main():
     app_path = Path(__file__).parent / "app.py"
     cmd = [
         sys.executable, "-m", "streamlit", "run", str(app_path),
-        "--server.port", str(args.port),
+        "--server.port", str(port),
         "--server.headless", "true",
         "--server.enableCORS", "false",
         "--server.enableXsrfProtection", "false",
     ]
-    print(f"[1/3] Streamlit 시작 중... (포트 {args.port})")
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # Streamlit 기동 대기
-    time.sleep(4)
-    if proc.poll() is not None:
-        print("[오류] Streamlit 실행에 실패했습니다. app.py 경로와 의존성을 확인하세요.")
-        sys.exit(1)
+    print(f"[1/3] Streamlit 시작 중... (포트 {port})")
+    stderr_log = tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=stderr_log)
+
+    # Streamlit 기동 대기 (최대 10초)
+    for _ in range(10):
+        time.sleep(1)
+        if proc.poll() is not None:
+            stderr_log.flush()
+            log_content = Path(stderr_log.name).read_text(encoding="utf-8", errors="ignore")
+            print(
+                f"[오류] Streamlit이 시작되지 않았습니다.\n"
+                f"--- 오류 로그 ---\n{log_content or '(로그 없음)'}\n"
+                "의존성 확인: pip install -r requirements.txt"
+            )
+            sys.exit(1)
+        # 포트가 열렸으면 준비 완료
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("localhost", port)) == 0:
+                break
+    else:
+        print(f"[경고] Streamlit 응답 대기 시간 초과. 계속 진행합니다.")
 
     # ── ngrok 터널 생성 ────────────────────────────────────────────
     print("[2/3] ngrok 터널 생성 중...")
     try:
-        tunnel = ngrok.connect(args.port, "http")
+        tunnel = ngrok.connect(port, "http")
     except Exception as e:
         print(f"[오류] ngrok 터널 생성 실패: {e}")
         proc.terminate()
@@ -100,7 +142,7 @@ def main():
     print(
         f"\n[3/3] 배포 완료!\n"
         f"  ✅ 공개 URL : {public_url}\n"
-        f"  🏠 로컬 URL : http://localhost:{args.port}\n"
+        f"  🏠 로컬 URL : http://localhost:{port}\n"
         f"\n  Ctrl+C 로 종료\n"
     )
 
