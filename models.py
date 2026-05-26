@@ -233,6 +233,56 @@ class TabularCNN1D(nn.Module):
 
 
 # ===========================================================================
+# 1-bis) STFT 스펙트로그램 전용 2D-CNN (CWRU 등)
+# ===========================================================================
+
+class STFTCNN2D(nn.Module):
+    """STFT 스펙트로그램 입력 전용 2D-CNN.
+
+    입력 shape: (B, 1, F, T)
+      F : frequency bins (보통 nperseg/2 + 1)
+      T : time frames
+
+    베어링 결함은 특정 주파수 대역에서 주기적으로 나타나므로, 시간-주파수 평면
+    위의 2D 패턴(BPFI/BPFO 사이드밴드 등)을 직접 학습할 수 있어 raw 1D 신호
+    보다 표현력이 높다. 일반적으로 CWRU에서 raw 1D-CNN 대비 +3~7% 정확도 향상.
+
+    출력/손실 매핑은 WDCNN1D와 동일:
+      n_classes == 1 → BCEWithLogitsLoss / ≥ 2 → CrossEntropyLoss
+    """
+    def __init__(self, in_channels: int = 1, n_classes: int = 3, dropout: float = 0.3):
+        super().__init__()
+        if n_classes < 1:
+            raise ValueError(f"n_classes must be >= 1, got {n_classes}")
+        self.n_classes = n_classes
+        # (1,F,T) → conv 점진 압축. GAP로 입력 (F,T) 크기 변화에 robust.
+        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, padding=1)
+        self.bn1   = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.bn2   = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn3   = nn.BatchNorm2d(64)
+        self.gap = nn.AdaptiveAvgPool2d((2, 2))
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(64 * 2 * 2, 64)
+        self.fc2 = nn.Linear(64, n_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4:
+            raise RuntimeError(
+                f"STFTCNN2D expects (B, C, F, T), got dim={x.dim()} shape={tuple(x.shape)}"
+            )
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.max_pool2d(x, 2)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.max_pool2d(x, 2)
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.gap(x).flatten(1)
+        x = self.dropout(F.relu(self.fc1(x)))
+        return self.fc2(x)
+
+
+# ===========================================================================
 # 2) Denoising Autoencoder + 내장 임계값
 # ===========================================================================
 
@@ -532,17 +582,18 @@ class BiLSTMRegressor(nn.Module):
 # 모델 팩토리
 # ===========================================================================
 
-ARCHS = ("cnn_vibration", "cnn_tabular", "ae", "lstm")
+ARCHS = ("cnn_vibration", "cnn_vibration_stft", "cnn_tabular", "ae", "lstm")
 
 
 def build_model(arch: str, **kwargs) -> nn.Module:
     """문자열 키 기반 모델 팩토리.
 
     arch:
-      "cnn_vibration"  : WDCNN1D       (CWRU 등 진동 신호)
-      "cnn_tabular"    : TabularCNN1D  (AI4I 등 짧은 테이블)
-      "ae"             : DenoisingAE
-      "lstm"           : BiLSTMRegressor
+      "cnn_vibration"      : WDCNN1D       (CWRU raw 1D 진동 신호)
+      "cnn_vibration_stft" : STFTCNN2D     (CWRU STFT 스펙트로그램)
+      "cnn_tabular"        : TabularCNN1D  (AI4I 등 짧은 테이블)
+      "ae"                 : DenoisingAE
+      "lstm"               : BiLSTMRegressor
 
     오타 방어: 알려지지 않은 arch는 difflib로 가까운 후보를 추천한다.
     예) "LSTM" → "Did you mean: lstm?"
@@ -555,6 +606,8 @@ def build_model(arch: str, **kwargs) -> nn.Module:
         )
     if arch == "cnn_vibration":
         return WDCNN1D(**kwargs)
+    if arch == "cnn_vibration_stft":
+        return STFTCNN2D(**kwargs)
     if arch == "cnn_tabular":
         return TabularCNN1D(**kwargs)
     if arch == "ae":

@@ -44,15 +44,15 @@ def get_token(cli_token: str | None) -> str:
 
 
 def find_free_port(start: int = 8501, end: int = 8600) -> int:
-    """start~end 범위에서 사용 가능한 포트를 반환."""
+    """start~end 범위에서 사용 가능한 포트를 반환.
+
+    connect_ex 방식으로 확인하여 0.0.0.0/localhost 바인딩 차이를 모두 감지한다.
+    """
     for port in range(start, end):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                s.bind(("localhost", port))
+            s.settimeout(0.1)
+            if s.connect_ex(("localhost", port)) != 0:
                 return port
-            except OSError:
-                continue
     raise RuntimeError(f"포트 {start}~{end} 범위에서 사용 가능한 포트를 찾을 수 없습니다.")
 
 
@@ -141,8 +141,8 @@ def main():
     public_url = tunnel.public_url
     print(
         f"\n[3/3] 배포 완료!\n"
-        f"  ✅ 공개 URL : {public_url}\n"
-        f"  🏠 로컬 URL : http://localhost:{port}\n"
+        f"  [OK]   공개 URL : {public_url}\n"
+        f"  [로컬] http://localhost:{port}\n"
         f"\n  Ctrl+C 로 종료\n"
     )
 

@@ -24,7 +24,7 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import config
 import data_pipeline as dp
@@ -90,6 +90,16 @@ def _build_cwru_cnn(data: Dict):
     )
 
 
+def _build_cwru_cnn_stft(data: Dict):
+    """CWRU STFT 스펙트로그램 (B, 1, F, T) 입력용 2D-CNN 빌더."""
+    return models.build_model(
+        "cnn_vibration_stft",
+        in_channels=1,
+        n_classes=data["meta"]["n_classes"],
+        dropout=config.CNN_CFG["dropout"],
+    )
+
+
 def _build_hydraulic_ae(data: Dict):
     return models.build_model(
         "ae",
@@ -124,12 +134,13 @@ def _build_ncmapss_lstm(data: Dict):
 
 # 등록부: name → (task_for_train, task_for_eval, builder)
 PIPELINE = {
-    "ai4i_cnn":     ("classification",    "binary_classification", _build_ai4i_cnn),
-    "ai4i_gbdt":    ("gbdt_binary",       "gbdt_binary",           _build_ai4i_gbdt),
-    "cwru_cnn":     ("classification",    "multiclass",            _build_cwru_cnn),
-    "hydraulic_ae": ("anomaly_detection", "anomaly_detection",     _build_hydraulic_ae),
-    "cmapss_lstm":  ("regression",        "regression",            _build_lstm),
-    "ncmapss_lstm": ("regression",        "regression",            _build_ncmapss_lstm),
+    "ai4i_cnn":      ("classification",    "binary_classification", _build_ai4i_cnn),
+    "ai4i_gbdt":     ("gbdt_binary",       "gbdt_binary",           _build_ai4i_gbdt),
+    "cwru_cnn":      ("classification",    "multiclass",            _build_cwru_cnn),
+    "cwru_cnn_stft": ("classification",    "multiclass",            _build_cwru_cnn_stft),
+    "hydraulic_ae":  ("anomaly_detection", "anomaly_detection",     _build_hydraulic_ae),
+    "cmapss_lstm":   ("regression",        "regression",            _build_lstm),
+    "ncmapss_lstm":  ("regression",        "regression",            _build_ncmapss_lstm),
 }
 
 
@@ -137,22 +148,27 @@ PIPELINE = {
 # 단일 데이터셋 파이프라인
 # ---------------------------------------------------------------------------
 
-def run_one(name: str, smoke: bool, skip_explain: bool) -> Dict:
-    """name 데이터셋 1개에 대해 load → train → eval (→ explain)."""
+def run_one(name: str, smoke: bool, skip_explain: bool) -> Tuple[Dict, Optional[Any], Optional[Dict]]:
+    """name 데이터셋 1개에 대해 load → train → eval (→ explain).
+
+    Returns:
+      (result_dict, trained_model_or_None, data_dict_or_None)
+      모델/데이터는 후처리(앙상블 등)를 위해 main에서 재사용한다.
+    """
     if name not in PIPELINE:
-        return {"name": name, "status": "unknown", "error": "no pipeline entry"}
+        return {"name": name, "status": "unknown", "error": "no pipeline entry"}, None, None
     train_task, eval_task, build_fn = PIPELINE[name]
 
     # 1) 데이터 로드
     try:
         data = dp.LOADERS[name]()
     except FileNotFoundError as e:
-        return {"name": name, "status": "skipped", "reason": str(e)}
+        return {"name": name, "status": "skipped", "reason": str(e)}, None, None
     except Exception as e:
         return {
             "name": name, "status": "load_failed",
             "error": str(e), "trace": traceback.format_exc(),
-        }
+        }, None, None
 
     # 2) 모델 빌드
     try:
@@ -164,7 +180,7 @@ def run_one(name: str, smoke: bool, skip_explain: bool) -> Dict:
         return {
             "name": name, "status": "build_failed",
             "error": str(e), "trace": traceback.format_exc(),
-        }
+        }, None, None
 
     # 3) 학습 (smoke 모드는 epoch=1로 패치)
     try:
@@ -190,7 +206,7 @@ def run_one(name: str, smoke: bool, skip_explain: bool) -> Dict:
         return {
             "name": name, "status": "train_failed",
             "error": str(e), "trace": traceback.format_exc(),
-        }
+        }, None, None
 
     # 4) 평가
     try:
@@ -209,7 +225,7 @@ def run_one(name: str, smoke: bool, skip_explain: bool) -> Dict:
             "name": name, "status": "eval_failed",
             "train": train_metrics,
             "error": str(e), "trace": traceback.format_exc(),
-        }
+        }, None, None
 
     result = {
         "name": name,
@@ -235,7 +251,7 @@ def run_one(name: str, smoke: bool, skip_explain: bool) -> Dict:
         except Exception as e:
             result["explain_error"] = str(e)
 
-    return result
+    return result, model, data
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +279,12 @@ def main():
         print("[HybridPdM] *** SMOKE MODE: epochs=1 ***")
 
     results: List[Dict] = []
+    # 후처리(스태킹 앙상블 등)를 위해 학습된 모델/데이터를 보관.
+    # AI4I CNN과 GBDT 둘 다 성공하면 자동으로 스태킹 평가를 추가한다.
+    trained: Dict[str, Tuple[Any, Dict]] = {}
     for name in args.datasets:
         print(f"\n=== {name} ===")
-        res = run_one(name, smoke=args.smoke, skip_explain=args.skip_explain)
+        res, model_obj, data_obj = run_one(name, smoke=args.smoke, skip_explain=args.skip_explain)
         status = res.get("status")
         if status == "ok":
             ev_m = res.get("eval", {})
@@ -273,11 +292,40 @@ def main():
                        if k in ("accuracy", "f1", "rmse", "mae", "r2",
                                 "test_f1", "best_threshold", "best_percentile")}
             print(f"  [OK]  {summary}")
+            if model_obj is not None and data_obj is not None:
+                trained[name] = (model_obj, data_obj)
         elif status == "skipped":
             print(f"  [--] skipped: {res.get('reason')}")
         else:
             print(f"  [FAIL] {status}: {res.get('error')}")
         results.append(res)
+
+    # ── 후처리: AI4I CNN+GBDT 스태킹 ─────────────────────────────────
+    # CNN과 GBDT가 모두 학습 성공했을 때만 시도. val grid로 (w_cnn, threshold)
+    # 동시 탐색하여 단일 모델 대비 F1이 더 높은지 자동 확인.
+    if "ai4i_cnn" in trained and "ai4i_gbdt" in trained:
+        print("\n=== ai4i_stack (CNN + GBDT ensemble) ===")
+        try:
+            cnn_model, cnn_data = trained["ai4i_cnn"]
+            gbdt_model, gbdt_data = trained["ai4i_gbdt"]
+            stack_metrics = ev.evaluate_ai4i_stacking(
+                cnn_model, gbdt_model, cnn_data, gbdt_data,
+            )
+            print(f"  [OK]  w_cnn={stack_metrics['weights']['cnn']:.2f} "
+                  f"thr={stack_metrics['decision_threshold']:.2f} "
+                  f"f1={stack_metrics['f1']:.4f}")
+            results.append({
+                "name": "ai4i_stack",
+                "status": "ok",
+                "train": {"note": "post-hoc ensemble of ai4i_cnn + ai4i_gbdt"},
+                "eval":  stack_metrics,
+            })
+        except Exception as e:
+            print(f"  [FAIL] ai4i_stack: {e}")
+            results.append({
+                "name": "ai4i_stack", "status": "stack_failed",
+                "error": str(e), "trace": traceback.format_exc(),
+            })
 
     # 전체 결과를 리포트로 저장 (run_id 포함 → 덮어쓰기 없이 누적)
     out_path = config.REPORT_DIR / f"pipeline_report_{run_id}.json"

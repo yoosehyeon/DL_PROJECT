@@ -28,7 +28,7 @@ config.RISK_LEVELS의 내림차순 임계값을 순회하여 첫 매칭으로 �
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -155,6 +155,132 @@ def compute_risk(
 # ---------------------------------------------------------------------------
 # 등급 매핑
 # ---------------------------------------------------------------------------
+
+def compute_risk_with_weights(
+    failure_prob: ArrayLike,
+    anomaly_score: ArrayLike,
+    rul_norm: ArrayLike,
+    weights: Dict[str, float],
+    fusion: str = "max",
+) -> np.ndarray:
+    """compute_risk와 동일하나 weights를 명시적으로 받는 변형.
+
+    optimize_weights() 내부에서 grid 후보 weights를 적용할 때 사용한다.
+    config.RISK_WEIGHTS를 변형하지 않고 안전하게 후보 가중치를 테스트할 수 있다.
+    """
+    if fusion == "weighted":
+        return weighted_sum(failure_prob, anomaly_score, rul_norm, weights)
+    if fusion == "noisy_or":
+        return noisy_or(failure_prob, anomaly_score, rul_norm, weights)
+    if fusion == "max":
+        ws  = weighted_sum(failure_prob, anomaly_score, rul_norm, weights)
+        nor = noisy_or(failure_prob, anomaly_score, rul_norm, weights)
+        return np.maximum(ws, nor).astype(np.float32)
+    raise ValueError(f"Unknown fusion '{fusion}'. Use 'weighted'|'noisy_or'|'max'.")
+
+
+# ---------------------------------------------------------------------------
+# 가중치 자동 최적화
+# ---------------------------------------------------------------------------
+
+def optimize_weights(
+    failure_prob: ArrayLike,
+    anomaly_score: ArrayLike,
+    rul_norm: ArrayLike,
+    y_true: ArrayLike,
+    fusion: str = "max",
+    metric: str = "f1",
+    weight_grid: Optional[List[float]] = None,
+    threshold_grid: Optional[List[float]] = None,
+) -> Dict:
+    """Risk Score 가중치 (w_f, w_a, w_r)을 grid search로 최적화한다.
+
+    파라미터:
+      failure_prob, anomaly_score, rul_norm : 세 모델의 동일 샘플에 대한 출력
+      y_true                                : 0/1 정답 라벨 (이상=1)
+      fusion                                : "weighted" | "noisy_or" | "max"
+      metric                                : "f1" | "pr_auc"
+        - "f1"    : 각 weight에 대해 threshold도 동시 탐색하여 최적 F1을 채택
+        - "pr_auc": Average Precision (threshold 불변 지표). 더 안정적이지만
+                    실제 운영 시 threshold는 별도로 정해야 한다.
+      weight_grid    : 각 weight 후보. 기본 [0.0, 0.1, ..., 1.0]
+      threshold_grid : F1 모드의 threshold 후보. 기본 [0.05, 0.10, ..., 0.95]
+
+    Returns:
+      {
+        "metric": "f1" | "pr_auc",
+        "fusion": ...,
+        "best_score": float,
+        "best_weights": {"failure": .., "anomaly": .., "rul": ..},  # 합=1 정규화
+        "best_threshold": float | None,                              # pr_auc 모드는 None
+        "n_evaluated": int,
+      }
+
+    주의: w_f + w_a + w_r == 0 인 후보는 자동 제외한다.
+    """
+    from sklearn.metrics import f1_score, average_precision_score
+
+    if weight_grid is None:
+        weight_grid = list(np.round(np.arange(0.0, 1.01, 0.1), 2))
+    if threshold_grid is None:
+        threshold_grid = list(np.round(np.arange(0.05, 1.0, 0.05), 2))
+
+    f = _as_array(failure_prob,  "failure_prob")
+    a = _as_array(anomaly_score, "anomaly_score")
+    r = _as_array(rul_norm,      "rul_norm")
+    y = np.asarray(y_true).astype(np.int32).reshape(-1)
+    if not (len(f) == len(a) == len(r) == len(y)):
+        raise ValueError(
+            f"length mismatch: f={len(f)} a={len(a)} r={len(r)} y={len(y)}"
+        )
+    if metric not in ("f1", "pr_auc"):
+        raise ValueError(f"metric must be 'f1' or 'pr_auc', got '{metric}'")
+
+    best = {"score": -1.0, "weights": None, "threshold": None}
+    n_eval = 0
+
+    for w_f in weight_grid:
+        for w_a in weight_grid:
+            for w_r in weight_grid:
+                s = float(w_f) + float(w_a) + float(w_r)
+                if s <= 0:
+                    continue
+                weights = {
+                    "failure": float(w_f) / s,
+                    "anomaly": float(w_a) / s,
+                    "rul":     float(w_r) / s,
+                }
+                R = compute_risk_with_weights(f, a, r, weights, fusion)
+                if metric == "f1":
+                    for thr in threshold_grid:
+                        yp = (R > float(thr)).astype(np.int32)
+                        score = float(f1_score(y, yp, zero_division=0))
+                        n_eval += 1
+                        if score > best["score"]:
+                            best = {
+                                "score": score,
+                                "weights": weights,
+                                "threshold": float(thr),
+                            }
+                else:  # pr_auc
+                    score = float(average_precision_score(y, R))
+                    n_eval += 1
+                    if score > best["score"]:
+                        best = {
+                            "score": score,
+                            "weights": weights,
+                            "threshold": None,
+                        }
+
+    return {
+        "metric": metric,
+        "fusion": fusion,
+        "best_score":     best["score"],
+        "best_weights":   best["weights"],
+        "best_threshold": best["threshold"],
+        "n_evaluated":    n_eval,
+    }
+
 
 def to_risk_level(score: ArrayLike) -> Union[str, List[str]]:
     """Risk Score 값을 등급 문자열로 변환.

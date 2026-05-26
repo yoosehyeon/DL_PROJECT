@@ -321,6 +321,98 @@ def evaluate_gbdt_classifier(
 
 
 # ---------------------------------------------------------------------------
+# 5) CNN + GBDT 스태킹 앙상블 (AI4I 전용)
+# ---------------------------------------------------------------------------
+
+def evaluate_ai4i_stacking(
+    cnn_model: nn.Module,
+    gbdt_model,
+    data_cnn: Dict,
+    data_gbdt: Dict,
+    cnn_weight: Optional[float] = None,
+) -> Dict:
+    """AI4I CNN과 GBDT의 확률 출력을 가중 평균으로 앙상블한다.
+
+    절차:
+      1) val set에서 두 모델 확률 산출 → 가중치 grid + threshold grid 동시 탐색
+         (cnn_weight=None일 때 [0.0, 0.1, ..., 1.0] 11개 grid 자동 탐색)
+      2) val F1을 최대화하는 (w_cnn, threshold) 채택
+      3) test set에 적용하여 표준 메트릭 보고
+
+    가정: data_cnn["X_val/test"]와 data_gbdt["X_val/test"]는 동일한 split
+          (load_ai4i_cnn → load_ai4i_gbdt 가 같은 SEED로 split하므로 성립).
+    """
+    device = torch.device(config.get_device())
+    cnn_model.to(device)
+    cnn_model.eval()
+
+    # ── CNN 확률 ─────────────────────────────────────────────────────
+    val_logits  = _batched_infer(cnn_model, data_cnn["X_val"],  device).reshape(-1)
+    test_logits = _batched_infer(cnn_model, data_cnn["X_test"], device).reshape(-1)
+    val_p_cnn   = 1.0 / (1.0 + np.exp(-val_logits))
+    test_p_cnn  = 1.0 / (1.0 + np.exp(-test_logits))
+
+    # ── GBDT 확률 ────────────────────────────────────────────────────
+    val_p_gbdt  = gbdt_model.predict_proba(data_gbdt["X_val"])[:,  1]
+    test_p_gbdt = gbdt_model.predict_proba(data_gbdt["X_test"])[:, 1]
+
+    y_val  = np.asarray(data_cnn["y_val"]).astype(np.int32)
+    y_test = np.asarray(data_cnn["y_test"]).astype(np.int32)
+
+    # ── 가중치 grid (auto) ───────────────────────────────────────────
+    if cnn_weight is None:
+        w_grid = np.arange(0.0, 1.01, 0.1)
+    else:
+        w_grid = np.array([float(cnn_weight)])
+
+    best = {"w_cnn": None, "threshold": None, "val_f1": -1.0}
+    per_weight_best: List[Dict] = []
+    for w in w_grid:
+        val_p = w * val_p_cnn + (1.0 - w) * val_p_gbdt
+        local_best = {"threshold": None, "val_f1": -1.0}
+        for thr in np.arange(0.05, 1.0, 0.05):
+            yp = (val_p > thr).astype(np.int32)
+            f1v = float(f1_score(y_val, yp, zero_division=0))
+            if f1v > local_best["val_f1"]:
+                local_best = {"threshold": float(thr), "val_f1": f1v}
+        per_weight_best.append({
+            "w_cnn": float(w),
+            "best_threshold": local_best["threshold"],
+            "best_val_f1": local_best["val_f1"],
+        })
+        if local_best["val_f1"] > best["val_f1"]:
+            best = {
+                "w_cnn": float(w),
+                "threshold": local_best["threshold"],
+                "val_f1": local_best["val_f1"],
+            }
+
+    if best["w_cnn"] is None:
+        raise RuntimeError("evaluate_ai4i_stacking: val grid search produced no result")
+
+    # ── test 적용 ────────────────────────────────────────────────────
+    w_cnn = best["w_cnn"]
+    used_thr = best["threshold"]
+    test_p = w_cnn * test_p_cnn + (1.0 - w_cnn) * test_p_gbdt
+    y_pred = (test_p > used_thr).astype(np.int32)
+
+    return {
+        "name": "ai4i_stack",
+        "task": "ensemble_binary",
+        "members": ["ai4i_cnn", "ai4i_gbdt"],
+        "weights": {"cnn": w_cnn, "gbdt": 1.0 - w_cnn},
+        "decision_threshold": used_thr,
+        "val_f1_at_best": best["val_f1"],
+        "weight_grid": per_weight_best,
+        "accuracy":  float(accuracy_score(y_test, y_pred)),
+        "precision": float(precision_score(y_test, y_pred, zero_division=0)),
+        "recall":    float(recall_score(y_test, y_pred, zero_division=0)),
+        "f1":        float(f1_score(y_test, y_pred, zero_division=0)),
+        "n_test":    int(len(y_test)),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 디스패처
 # ---------------------------------------------------------------------------
 

@@ -169,11 +169,12 @@ def explain_classifier(
         tc = 0 if target_class is None else int(target_class)
         wrapped = _MultiClsWrapper(model, tc)
 
-    attr = _ig_attribute(wrapped, X, device)        # (B, C, L)
+    attr = _ig_attribute(wrapped, X, device)        # (B, C, L) 또는 (B, C, F, T)
 
-    # 입력 길이 L > 1이면 위치(시퀀스) 축이 의미 단위 → 그것을 feature로 사용
-    # 길이 L == 1 (vibration의 GAP 후가 아님 - 여기선 raw input이라 길이가 큼)
-    if attr.shape[-1] > attr.shape[1]:
+    # STFT 2D 입력 (B, 1, F, T): 시간축(T) 평균 → 주파수 bin(F)별 중요도
+    if attr.ndim == 4:
+        scores = np.abs(attr).mean(axis=(0, 1, 3))   # (F,)
+    elif attr.shape[-1] > attr.shape[1]:
         # 길이 >> 채널 → 위치 기반 (예: AI4I (B,1,11), CWRU (B,1,1024))
         scores = _aggregate_to_features(attr, mode="BCL_seq")
     else:
