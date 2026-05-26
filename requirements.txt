@@ -2,24 +2,30 @@
 # 설치: pip install -r requirements.txt
 
 # ── 딥러닝 코어 ────────────────────────────────────────────────
-torch>=2.0.0          # 모델 학습/추론 (1D-CNN, AE, BiLSTM)
+torch>=2.0.0          # 모델 학습/추론 (1D-CNN, STFT 2D-CNN, AE, BiLSTM)
 
 # ── 수치/데이터 처리 ──────────────────────────────────────────
 numpy>=1.23
 pandas>=1.5           # AI4I CSV, C-MAPSS txt 파싱
-scipy>=1.10           # CWRU .mat 파일 로드 (scipy.io)
+scipy>=1.10           # CWRU .mat 로드 (scipy.io) + STFT (scipy.signal.stft)
 h5py>=3.8             # N-CMAPSS .h5 파일 로드
 
 # ── 머신러닝 유틸 ─────────────────────────────────────────────
-scikit-learn>=1.2     # train_test_split, StandardScaler, metrics
+scikit-learn>=1.2     # train_test_split, StandardScaler, HistGradientBoosting, metrics
 
 # ── 모델 해석 (PRD §5) ────────────────────────────────────────
-captum>=0.7           # IntegratedGradients 기반 피처 중요도
+captum>=0.7           # IntegratedGradients 기반 피처 중요도 (4D STFT 입력 지원)
 
 # ── 시각화 / 리포트 ───────────────────────────────────────────
-matplotlib>=3.6       # 학습 곡선, Risk Score 그래프
+matplotlib>=3.6       # 학습 곡선, Risk Score 그래프, 혼동 행렬
+seaborn>=0.12         # heatmap (상관관계 / 혼동 행렬), 성능분석 노트북 필수
 tqdm>=4.65            # 학습 진행률 표시 (옵션)
 
 # ── 대시보드 / 배포 (PRD 기술스택) ────────────────────────────
 streamlit>=1.30       # PRD §6 대시보드 UI
 pyngrok>=7.0          # PRD ngrok 터널링 (Colab/원격 배포용)
+
+# ── 분석 노트북 실행용 (performance analysis/*.ipynb) ─────────
+# VS Code 노트북 UI나 jupyter notebook/lab으로 실행할 때 필요
+ipykernel>=6.0        # Python 커널
+jupyter>=1.0          # (선택) `jupyter notebook performance\ analysis/` 실행 시
