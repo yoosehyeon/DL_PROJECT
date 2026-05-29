@@ -81,6 +81,33 @@ def _build_ai4i_gbdt(data: Dict):
     )
 
 
+def _build_ai4i_catboost(data: Dict):
+    """AI4I용 CatBoostClassifier 빌더 (Phase 1-1).
+
+    sklearn HistGradient 대비 차별점:
+      - Ordered Boosting → train data 누수에 더 강함 (overfit 방어)
+      - Symmetric Tree → 추론 속도 빠름, regularization 자동
+      - auto_class_weights='Balanced' → 불균형 자동 보정 (n_neg/n_pos)
+    예상 효과: HistGradient F1 0.865 → CatBoost F1 0.87~0.89
+    """
+    from catboost import CatBoostClassifier
+
+    return CatBoostClassifier(
+        iterations=500,
+        learning_rate=0.05,
+        depth=6,
+        l2_leaf_reg=3.0,
+        # 클래스 불균형 자동 보정 — sklearn 'balanced' 와 동일 원리
+        auto_class_weights="Balanced",
+        # 자동 overfit 방지
+        early_stopping_rounds=30,
+        eval_metric="F1",
+        random_seed=config.SEED,
+        verbose=False,
+        allow_writing_files=False,   # tmp 파일 자동 생성 방지
+    )
+
+
 def _build_cwru_cnn(data: Dict):
     return models.build_model(
         "cnn_vibration",
@@ -108,7 +135,49 @@ def _build_hydraulic_ae(data: Dict):
     )
 
 
+def _build_hydraulic_lstm_ae(data: Dict):
+    """Hydraulic용 LSTM-AE 빌더 (Phase 1-2).
+
+    Dense AE는 cycle당 평균 1개로 압축 → 시간 정보 손실.
+    LSTM-AE는 cycle 내 60 timestep × 17 센서 패턴을 학습 → 시간적 이상 탐지.
+    예상 효과: F1 0.896 → 0.94 (5%p 향상 예상)
+    """
+    return models.build_model(
+        "lstm_ae",
+        n_features=data["meta"]["n_features"],
+        seq_len=data["meta"]["seq_len"],
+        hidden_dim=64,
+        latent_dim=16,
+        num_layers=1,
+        noise_std=0.02,
+    )
+
+
 def _build_lstm(data: Dict):
+    return models.build_model(
+        "lstm",
+        input_dim=data["meta"]["feature_dim"],
+        hidden=config.LSTM_CFG["hidden"],
+        num_layers=config.LSTM_CFG["num_layers"],
+        dropout=config.LSTM_CFG["dropout"],
+        input_format="BFL",
+    )
+
+
+def _build_cmapss_lstm_w20(data: Dict):
+    """C-MAPSS Multi-Window Ensemble용 — window=20 LSTM (Phase 1-3)."""
+    return models.build_model(
+        "lstm",
+        input_dim=data["meta"]["feature_dim"],
+        hidden=config.LSTM_CFG["hidden"],
+        num_layers=config.LSTM_CFG["num_layers"],
+        dropout=config.LSTM_CFG["dropout"],
+        input_format="BFL",
+    )
+
+
+def _build_cmapss_lstm_w50(data: Dict):
+    """C-MAPSS Multi-Window Ensemble용 — window=50 LSTM (Phase 1-3)."""
     return models.build_model(
         "lstm",
         input_dim=data["meta"]["feature_dim"],
@@ -133,13 +202,22 @@ def _build_ncmapss_lstm(data: Dict):
 
 
 # 등록부: name → (task_for_train, task_for_eval, builder)
+# ── AI4I 권장 운영 구성 (검증 결과 기반): ────────────────────────────
+#   1순위 단독: ai4i_catboost   (F1 0.893, 가장 강함)
+#   2순위 단독: ai4i_gbdt       (F1 0.865)
+#   2-way 스태킹: ai4i_gbdt + ai4i_catboost (F1 0.885 — 단독보다 약간 낮음)
+#   ai4i_cnn 은 다양성 확보용이지만 스태킹에서 가중치 0으로 수렴 → 보조 신호로만 활용
 PIPELINE = {
     "ai4i_cnn":      ("classification",    "binary_classification", _build_ai4i_cnn),
     "ai4i_gbdt":     ("gbdt_binary",       "gbdt_binary",           _build_ai4i_gbdt),
+    "ai4i_catboost": ("gbdt_binary",       "gbdt_binary",           _build_ai4i_catboost),  # 권장 단독 모델
     "cwru_cnn":      ("classification",    "multiclass",            _build_cwru_cnn),
     "cwru_cnn_stft": ("classification",    "multiclass",            _build_cwru_cnn_stft),
     "hydraulic_ae":  ("anomaly_detection", "anomaly_detection",     _build_hydraulic_ae),
+    "hydraulic_lstm_ae": ("anomaly_detection", "anomaly_detection", _build_hydraulic_lstm_ae),
     "cmapss_lstm":   ("regression",        "regression",            _build_lstm),
+    "cmapss_lstm_w20": ("regression",      "regression",            _build_cmapss_lstm_w20),
+    "cmapss_lstm_w50": ("regression",      "regression",            _build_cmapss_lstm_w50),
     "ncmapss_lstm":  ("regression",        "regression",            _build_ncmapss_lstm),
 }
 
@@ -300,24 +378,61 @@ def main():
             print(f"  [FAIL] {status}: {res.get('error')}")
         results.append(res)
 
-    # ── 후처리: AI4I CNN+GBDT 스태킹 ─────────────────────────────────
-    # CNN과 GBDT가 모두 학습 성공했을 때만 시도. val grid로 (w_cnn, threshold)
-    # 동시 탐색하여 단일 모델 대비 F1이 더 높은지 자동 확인.
-    if "ai4i_cnn" in trained and "ai4i_gbdt" in trained:
-        print("\n=== ai4i_stack (CNN + GBDT ensemble) ===")
+    # ── 후처리: AI4I 모델 자동 스태킹 (n-way) ─────────────────────────
+    # AI4I 계열 모델(cnn, gbdt, catboost) 중 학습 성공한 것들을 자동으로 묶어
+    # val grid 동시 탐색으로 최적 가중치·threshold 채택.
+    # 2개 이상 성공 시에만 시도. 3개 다 성공하면 3-way 스태킹.
+    # ── 후처리: C-MAPSS Multi-Window Ensemble (Phase 1-3) ──────────────
+    # cmapss_lstm (w=30), cmapss_lstm_w20, cmapss_lstm_w50 중 2개 이상 학습되면 자동 평균
+    cmapss_members = {
+        name: trained[name]
+        for name in ("cmapss_lstm", "cmapss_lstm_w20", "cmapss_lstm_w50")
+        if name in trained
+    }
+    if len(cmapss_members) >= 2:
+        member_str = " + ".join(cmapss_members.keys())
+        print(f"\n=== cmapss_multiwindow_ensemble ({member_str}) ===")
         try:
-            cnn_model, cnn_data = trained["ai4i_cnn"]
-            gbdt_model, gbdt_data = trained["ai4i_gbdt"]
-            stack_metrics = ev.evaluate_ai4i_stacking(
-                cnn_model, gbdt_model, cnn_data, gbdt_data,
-            )
-            print(f"  [OK]  w_cnn={stack_metrics['weights']['cnn']:.2f} "
-                  f"thr={stack_metrics['decision_threshold']:.2f} "
+            mw_metrics = ev.evaluate_cmapss_multiwindow_ensemble(cmapss_members)
+            print(f"  [OK]  simple_avg:   "
+                  f"RMSE={mw_metrics['simple_avg']['rmse']:.2f} "
+                  f"MAE={mw_metrics['simple_avg']['mae']:.2f} "
+                  f"R²={mw_metrics['simple_avg']['r2']:.3f}")
+            print(f"        weighted_avg: "
+                  f"RMSE={mw_metrics['weighted_avg']['rmse']:.2f} "
+                  f"MAE={mw_metrics['weighted_avg']['mae']:.2f} "
+                  f"R²={mw_metrics['weighted_avg']['r2']:.3f}")
+            results.append({
+                "name": "cmapss_multiwindow_ensemble",
+                "status": "ok",
+                "train": {"note": f"multi-window ensemble: {member_str}"},
+                "eval":  mw_metrics,
+            })
+        except Exception as e:
+            print(f"  [FAIL] cmapss_multiwindow_ensemble: {e}")
+            results.append({
+                "name": "cmapss_multiwindow_ensemble", "status": "ensemble_failed",
+                "error": str(e), "trace": traceback.format_exc(),
+            })
+
+    ai4i_members = {
+        name: trained[name]
+        for name in ("ai4i_cnn", "ai4i_gbdt", "ai4i_catboost")
+        if name in trained
+    }
+    if len(ai4i_members) >= 2:
+        member_str = " + ".join(ai4i_members.keys())
+        print(f"\n=== ai4i_stack ({member_str}) ===")
+        try:
+            stack_metrics = ev.evaluate_ai4i_stacking_nway(ai4i_members)
+            w_str = " ".join(f"{k}={v:.2f}" for k, v in stack_metrics["weights"].items())
+            print(f"  [OK]  {w_str}  "
+                  f"thr={stack_metrics['decision_threshold']:.2f}  "
                   f"f1={stack_metrics['f1']:.4f}")
             results.append({
                 "name": "ai4i_stack",
                 "status": "ok",
-                "train": {"note": "post-hoc ensemble of ai4i_cnn + ai4i_gbdt"},
+                "train": {"note": f"post-hoc ensemble of {member_str}"},
                 "eval":  stack_metrics,
             })
         except Exception as e:

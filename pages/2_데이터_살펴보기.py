@@ -45,12 +45,16 @@ with tab1:
     import data_pipeline as dp
 
     DS_OPTIONS: dict[str, str] = {
-        "ai4i_cnn":     "AI4I — 11개 센서 (가공 장비, 고장 분류용)",
-        "ai4i_gbdt":    "AI4I — 11개 센서 (가공 장비, GBDT용 평탄형)",
-        "cwru_cnn":     "CWRU — 진동 신호 1024 샘플 (베어링)",
-        "hydraulic_ae": "Hydraulic — 17개 센서 (유압 시스템)",
-        "cmapss_lstm":  "C-MAPSS — 14개 센서 × 30 시점 (터빈 엔진)",
-        "ncmapss_lstm": "N-CMAPSS — 43개 센서 × 30 시점 (실제 비행 조건)",
+        "ai4i_cnn":          "AI4I — 11개 센서 (가공 장비, CNN 입력)",
+        "ai4i_gbdt":         "AI4I — 11개 센서 (GBDT/CatBoost 평탄형)",
+        "cwru_cnn":          "CWRU — 진동 신호 1024 샘플 (베어링, raw 1D)",
+        "cwru_cnn_stft":     "CWRU — STFT 스펙트로그램 (베어링, 2D)",
+        "hydraulic_ae":      "Hydraulic — 17개 센서 (cycle 평균)",
+        "hydraulic_lstm_ae": "Hydraulic — 17개 센서 × 60 시점 (cycle 내 시계열)",
+        "cmapss_lstm":       "C-MAPSS — 14개 센서 × 30 시점 (터빈 엔진)",
+        "cmapss_lstm_w20":   "C-MAPSS — 14개 센서 × 20 시점",
+        "cmapss_lstm_w50":   "C-MAPSS — 14개 센서 × 50 시점",
+        "ncmapss_lstm":      "N-CMAPSS — 43개 센서 × 30 시점 (실제 비행 조건)",
     }
 
     st.markdown("### 분석할 데이터셋 선택")

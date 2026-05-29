@@ -99,7 +99,10 @@ AE_CFG = {
     "weight_decay": 1e-5,
     "latent_dim": 16,
     "early_stop_patience": 10,
-    "threshold_grid": list(range(85, 100)),  # val F1을 최대화하는 percentile 탐색 구간
+    # threshold_grid: 85~99 → 70~99 로 확장 (P1-1).
+    # 기존 85가 grid 하한값이 best로 채택되어 더 낮은 percentile에서 추가 향상
+    # 여지 시사. 70으로 확장하면 보수적/공격적 임계값 모두 탐색 가능.
+    "threshold_grid": list(range(70, 100)),  # val F1을 최대화하는 percentile 탐색 구간
 }
 
 # 3.3) LSTM (RUL 예측) — C-MAPSS 기본
@@ -140,7 +143,10 @@ NCMAPSS_LSTM_CFG = {
     # data_pipeline 전용 파라미터
     "stride": 10,
     "max_units_train": 20,
-    "max_units_test": 20,
+    # max_units_test: 20 → 50 으로 확장 (P0-1).
+    # 기존 20은 test RUL 분포 표준편차가 ~4.45 cycle 에 불과해 R² 가 음수로 나오는
+    # 분산 부족 문제를 야기. 50개 엔진으로 확장하면 분포가 다양해져 R² 안정화.
+    "max_units_test": 50,
     "max_windows_per_unit": 3000,
 }
 

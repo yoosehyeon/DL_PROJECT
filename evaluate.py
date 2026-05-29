@@ -257,16 +257,37 @@ def evaluate_regressor(
     rmse = float(np.sqrt(mse))
     mae  = float(mean_absolute_error(y, pred))
     r2   = float(r2_score(y, pred))
-    return {
+
+    # R² 음수 자동 경고 (P3-2):
+    # R² < 0 은 "모델이 단순 평균 예측보다도 못함"을 의미.
+    # 보통 test 분포의 분산이 비정상적으로 작거나(분포 왜곡), 모델이 train/test
+    # 분포 shift에 실패했을 때 발생. RMSE 만 보면 놓치기 쉬워 명시적 경고 출력.
+    warnings_list = []
+    y_std = float(np.std(y))
+    if r2 < 0:
+        # ASCII-only 메시지: Windows cp949 콘솔에서 unicode dash 등이 깨지지 않도록 한다.
+        msg = (
+            f"R2={r2:.3f} (negative) - test std={y_std:.3f} too small, "
+            f"mean-prediction baseline dominates. RMSE={rmse:.2f} alone is misleading. "
+            f"Consider expanding sampling (e.g. max_units_test) in config for '{name}'."
+        )
+        warnings_list.append({"code": "negative_r2", "message": msg})
+        print(f"[evaluate_regressor:WARN] {name} -> {msg}")
+
+    out = {
         "name": name,
         "task": "regression",
         "rmse": rmse,
         "mae":  mae,
         "mse":  mse,
         "r2":   r2,
+        "y_test_std": y_std,
         "n_test": int(len(y)),
         "rul_norm": bool(rul_norm),
     }
+    if warnings_list:
+        out["warnings"] = warnings_list
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +430,211 @@ def evaluate_ai4i_stacking(
         "recall":    float(recall_score(y_test, y_pred, zero_division=0)),
         "f1":        float(f1_score(y_test, y_pred, zero_division=0)),
         "n_test":    int(len(y_test)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6) N-way 스태킹 앙상블 (AI4I - CNN + GBDT + CatBoost 등 임의 조합)
+# ---------------------------------------------------------------------------
+
+def evaluate_ai4i_stacking_nway(
+    members: Dict[str, tuple],
+    weight_step: float = 0.1,
+) -> Dict:
+    """임의 개수의 AI4I 모델을 가중 평균으로 앙상블한다.
+
+    파라미터:
+      members      : {name: (model, data_dict)} — 각 모델은 .pt/.pkl 어느 쪽이든 OK
+      weight_step  : 가중치 grid step (기본 0.1, 즉 11개 후보 weight)
+
+    절차:
+      1) 각 멤버에 대해 val/test 확률 추출
+         - nn.Module: sigmoid(logit)
+         - sklearn/CatBoost: predict_proba[:, 1]
+      2) 가중치 grid (Dirichlet 격자) × threshold grid 로 (w_vec, thr) 동시 탐색
+      3) val F1 최대 조합을 채택, test 메트릭 보고
+
+    가중치 정규화: w_vec 합이 1이 되도록 자동 정규화. 합이 0인 후보는 skip.
+    """
+    if len(members) < 2:
+        raise ValueError("evaluate_ai4i_stacking_nway requires >= 2 members")
+
+    device = torch.device(config.get_device())
+    member_names = list(members.keys())
+
+    val_probs: Dict[str, np.ndarray] = {}
+    test_probs: Dict[str, np.ndarray] = {}
+    y_val_ref: Optional[np.ndarray] = None
+    y_test_ref: Optional[np.ndarray] = None
+
+    for name, (model, data) in members.items():
+        # nn.Module 분기: sigmoid(logit). 그 외(sklearn/CatBoost)는 predict_proba.
+        if isinstance(model, nn.Module):
+            model.to(device).eval()
+            val_logits  = _batched_infer(model, data["X_val"],  device).reshape(-1)
+            test_logits = _batched_infer(model, data["X_test"], device).reshape(-1)
+            val_probs[name]  = 1.0 / (1.0 + np.exp(-val_logits))
+            test_probs[name] = 1.0 / (1.0 + np.exp(-test_logits))
+        else:
+            val_probs[name]  = model.predict_proba(data["X_val"])[:,  1]
+            test_probs[name] = model.predict_proba(data["X_test"])[:, 1]
+
+        # 정답 라벨 일치성 확인 (모든 멤버가 같은 split 가정)
+        y_val_cur  = np.asarray(data["y_val"]).astype(np.int32)
+        y_test_cur = np.asarray(data["y_test"]).astype(np.int32)
+        if y_val_ref is None:
+            y_val_ref, y_test_ref = y_val_cur, y_test_cur
+        else:
+            if not (np.array_equal(y_val_ref, y_val_cur) and
+                    np.array_equal(y_test_ref, y_test_cur)):
+                raise RuntimeError(
+                    f"stacking members have mismatched labels — "
+                    f"동일한 split (같은 SEED) 사용해야 함"
+                )
+
+    # 가중치 grid (Dirichlet-style): 각 weight ∈ {0, 0.1, ..., 1.0}, 합 정규화
+    candidates = list(np.round(np.arange(0.0, 1.0 + 1e-9, weight_step), 2))
+    threshold_grid = list(np.round(np.arange(0.05, 1.0, 0.05), 2))
+
+    n_members = len(member_names)
+    best = {"weights": None, "threshold": None, "val_f1": -1.0}
+    n_eval = 0
+
+    def _iter_weights(remain: int, current: list):
+        """n_members 길이의 weight 후보 (전수 탐색)."""
+        if remain == 1:
+            yield current + [0.0]   # placeholder, normalize 단계에서 무관
+            return
+        for w in candidates:
+            yield from _iter_weights(remain - 1, current + [w])
+
+    for w_partial in _iter_weights(n_members, []):
+        # 마지막 위치만 candidates 순회 (전수 탐색)
+        for last in candidates:
+            w = np.array(w_partial[:-1] + [last], dtype=np.float64)
+            s = w.sum()
+            if s <= 0:
+                continue
+            w = w / s   # 정규화
+            # val 가중 평균
+            val_blend = sum(w[i] * val_probs[name] for i, name in enumerate(member_names))
+            for thr in threshold_grid:
+                yp = (val_blend > thr).astype(np.int32)
+                f1v = float(f1_score(y_val_ref, yp, zero_division=0))
+                n_eval += 1
+                if f1v > best["val_f1"]:
+                    best = {
+                        "weights": {name: float(w[i]) for i, name in enumerate(member_names)},
+                        "threshold": float(thr),
+                        "val_f1": f1v,
+                    }
+
+    if best["weights"] is None:
+        raise RuntimeError("evaluate_ai4i_stacking_nway: grid search produced no result")
+
+    # test 적용
+    test_blend = sum(best["weights"][name] * test_probs[name] for name in member_names)
+    y_pred = (test_blend > best["threshold"]).astype(np.int32)
+
+    return {
+        "name": "ai4i_stack_nway",
+        "task": "ensemble_binary",
+        "members": member_names,
+        "weights": best["weights"],
+        "decision_threshold": best["threshold"],
+        "val_f1_at_best": best["val_f1"],
+        "n_combinations_evaluated": n_eval,
+        "accuracy":  float(accuracy_score(y_test_ref, y_pred)),
+        "precision": float(precision_score(y_test_ref, y_pred, zero_division=0)),
+        "recall":    float(recall_score(y_test_ref, y_pred, zero_division=0)),
+        "f1":        float(f1_score(y_test_ref, y_pred, zero_division=0)),
+        "n_test":    int(len(y_test_ref)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7) C-MAPSS Multi-Window 회귀 앙상블 (Phase 1-3)
+# ---------------------------------------------------------------------------
+
+def evaluate_cmapss_multiwindow_ensemble(
+    members: Dict[str, tuple],
+) -> Dict:
+    """C-MAPSS multi-window LSTM 앙상블 (예측 평균).
+
+    파라미터:
+      members : {name: (model, data)} — 각각 다른 window 길이로 학습된 LSTM
+
+    절차:
+      1) 각 모델로 test 추론
+      2) test set이 모델마다 다를 수 있으므로 (window별 마지막 window 만 선택 →
+         실제로 test 엔진 수가 동일하므로 비교 가능)
+      3) 단순 평균 / 가중 평균 (val RMSE 역수 기반) 두 가지 보고
+    """
+    if len(members) < 2:
+        raise ValueError("multi-window ensemble requires >= 2 members")
+
+    device = torch.device(config.get_device())
+    member_preds: Dict[str, np.ndarray] = {}
+    member_val_rmse: Dict[str, float] = {}
+    y_test_ref: Optional[np.ndarray] = None
+
+    for name, (model, data) in members.items():
+        model.to(device).eval()
+        meta = data.get("meta", {})
+        rul_norm = meta.get("rul_norm", False)
+        rul_clip = meta.get("rul_clip", 1.0)
+
+        # test 예측
+        pred = _batched_infer(model, data["X_test"], device).reshape(-1)
+        y    = np.asarray(data["y_test"]).reshape(-1).astype(np.float32)
+        if rul_norm:
+            pred = pred * rul_clip
+            y    = y * rul_clip
+        member_preds[name] = pred
+
+        # val RMSE (가중 평균용)
+        val_pred = _batched_infer(model, data["X_val"], device).reshape(-1)
+        val_y    = np.asarray(data["y_val"]).reshape(-1).astype(np.float32)
+        if rul_norm:
+            val_pred = val_pred * rul_clip
+            val_y    = val_y * rul_clip
+        member_val_rmse[name] = float(np.sqrt(mean_squared_error(val_y, val_pred)))
+
+        if y_test_ref is None:
+            y_test_ref = y
+        elif len(y) == len(y_test_ref):
+            # 엔진 단위 마지막 window 선택은 동일하므로 길이 같으면 OK
+            pass
+        else:
+            raise RuntimeError(
+                f"multi-window members have mismatched test size: "
+                f"{name}={len(y)} vs ref={len(y_test_ref)}"
+            )
+
+    # 단순 평균
+    simple_avg = np.mean([member_preds[n] for n in members], axis=0)
+    rmse_simple = float(np.sqrt(mean_squared_error(y_test_ref, simple_avg)))
+    mae_simple  = float(mean_absolute_error(y_test_ref, simple_avg))
+    r2_simple   = float(r2_score(y_test_ref, simple_avg))
+
+    # 가중 평균 (val RMSE 역수 정규화)
+    inv_rmse = {n: 1.0 / (member_val_rmse[n] + 1e-6) for n in members}
+    total = sum(inv_rmse.values())
+    weights = {n: inv_rmse[n] / total for n in members}
+    weighted = sum(weights[n] * member_preds[n] for n in members)
+    rmse_weighted = float(np.sqrt(mean_squared_error(y_test_ref, weighted)))
+    mae_weighted  = float(mean_absolute_error(y_test_ref, weighted))
+    r2_weighted   = float(r2_score(y_test_ref, weighted))
+
+    return {
+        "name": "cmapss_multiwindow_ensemble",
+        "task": "regression_ensemble",
+        "members": list(members.keys()),
+        "member_val_rmse": member_val_rmse,
+        "weights_for_weighted_avg": weights,
+        "simple_avg":   {"rmse": rmse_simple,   "mae": mae_simple,   "r2": r2_simple},
+        "weighted_avg": {"rmse": rmse_weighted, "mae": mae_weighted, "r2": r2_weighted},
+        "n_test": int(len(y_test_ref)),
     }
 
 

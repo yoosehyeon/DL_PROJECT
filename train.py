@@ -475,7 +475,9 @@ def train_autoencoder(
     )
     # Mahalanobis 통계 적합 (combined_score 사용 가능하게 함).
     # 평가 단계에서 use_mahalanobis 플래그로 활용 여부를 결정.
-    model.fit_mahalanobis(X_tr_t, batch_size=cfg["batch_size"])
+    # LSTM-AE 등 latent Mahalanobis를 지원하지 않는 모델은 조용히 skip.
+    if hasattr(model, "fit_mahalanobis"):
+        model.fit_mahalanobis(X_tr_t, batch_size=cfg["batch_size"])
 
     metrics = {
         "name": name,

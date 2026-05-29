@@ -8,3 +8,7 @@ artifacts/checkpoints/*_2026*.pkl
 artifacts/reports/
 dataset/
 .env
+
+# Claude 작업 디렉터리 (메모리 / 스케줄 락 등) — 깃 제외
+.claude/
+CLAUDE.md

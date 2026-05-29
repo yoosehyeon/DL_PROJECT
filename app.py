@@ -55,12 +55,14 @@ ui.render_intent(
 # 모델 카탈로그 정의 (탭 간 공유)
 # =====================================================================
 MODEL_LIST: list[tuple[str, str, str]] = [
-    ("CNN (AI4I)", "ai4i_cnn", ".pt"),
-    ("GBDT (AI4I)", "ai4i_gbdt", ".pkl"),
-    ("CNN (CWRU)", "cwru_cnn", ".pt"),
-    ("AE (Hydraulic)", "hydraulic_ae", ".pt"),
-    ("LSTM (C-MAPSS)", "cmapss_lstm", ".pt"),
-    ("LSTM (N-CMAPSS)", "ncmapss_lstm", ".pt"),
+    ("CNN (AI4I)",            "ai4i_cnn",      ".pt"),
+    ("GBDT (AI4I)",           "ai4i_gbdt",     ".pkl"),
+    ("CatBoost (AI4I) ★",     "ai4i_catboost", ".pkl"),
+    ("CNN raw (CWRU)",        "cwru_cnn",      ".pt"),
+    ("CNN STFT (CWRU) ★",     "cwru_cnn_stft", ".pt"),
+    ("AE (Hydraulic) ★",      "hydraulic_ae",  ".pt"),
+    ("LSTM (C-MAPSS)",        "cmapss_lstm",   ".pt"),
+    ("LSTM (N-CMAPSS) ★",     "ncmapss_lstm",  ".pt"),
 ]
 ready_flags = {key: bool(list(config.CHECKPOINT_DIR.glob(f"{key}*{ext}")))
                for _, key, ext in MODEL_LIST}

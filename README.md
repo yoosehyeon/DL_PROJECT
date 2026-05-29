@@ -93,32 +93,60 @@
 
 ## 지원 데이터셋 · 모델
 
-| 키 (`--datasets`) | 데이터셋 | 모델 | 태스크 |
-|---|---|---|---|
-| `ai4i_cnn` | AI4I 2020 | 1D-CNN (tabular) | Binary Classification |
-| `ai4i_gbdt` | AI4I 2020 | HistGradientBoosting | Binary Classification |
-| `cwru_cnn` | CWRU Bearing | 1D-CNN (raw vibration) | Multi-class Classification |
-| `cwru_cnn_stft`  | CWRU Bearing | **2D-CNN (STFT 스펙트로그램)** | Multi-class Classification |
-| `hydraulic_ae` | UCI Hydraulic | Autoencoder | Anomaly Detection |
-| `cmapss_lstm` | NASA C-MAPSS | BiLSTM | RUL Regression |
-| `ncmapss_lstm` | NASA N-CMAPSS | BiLSTM (hidden=256) | RUL Regression |
+| 키 (`--datasets`) | 데이터셋 | 모델 | 태스크 | 현재 성능 |
+|---|---|---|---|---|
+| `ai4i_cnn` | AI4I 2020 | 1D-CNN (tabular) | Binary Classification | F1 0.774 |
+| `ai4i_gbdt` | AI4I 2020 | HistGradientBoosting | Binary Classification | F1 0.865 |
+| **`ai4i_catboost`** ★ | AI4I 2020 | **CatBoost** | Binary Classification | **F1 0.893** |
+| `cwru_cnn` | CWRU Bearing | 1D-CNN (raw vibration) | Multi-class Classification | Acc 0.965 |
+| **`cwru_cnn_stft`** ★ | CWRU Bearing | **2D-CNN (STFT 스펙트로그램)** | Multi-class Classification | **Acc 1.000** |
+| **`hydraulic_ae`** ★ | UCI Hydraulic | Denoising Autoencoder | Anomaly Detection | **F1 0.896** |
+| `hydraulic_lstm_ae` | UCI Hydraulic | LSTM-Autoencoder (실험적) | Anomaly Detection | F1 0.605 (비권장) |
+| `cmapss_lstm` | NASA C-MAPSS | BiLSTM (window=30) | RUL Regression | RMSE 13.48 |
+| `cmapss_lstm_w20` | NASA C-MAPSS | BiLSTM (window=20) | RUL Regression | RMSE 16.85 |
+| `cmapss_lstm_w50` | NASA C-MAPSS | BiLSTM (window=50) | RUL Regression | RMSE 15.41 |
+| **`ncmapss_lstm`** ★ | NASA N-CMAPSS | BiLSTM (hidden=256) + Huber | RUL Regression | **RMSE 8.96, R² 0.868** |
 
+> ★ 표시는 **각 데이터셋별 현재 최고 성능 모델**입니다.
 > AI4I CNN은 극불균형(약 3% 양성) 대응을 위해 **Focal Loss(α=0.85, γ=2.0)** 를 기본 사용합니다.
-> N-CMAPSS LSTM은 43개 피처 · 대용량 데이터에 맞춰 **Huber Loss(δ=5.0)** 와 stride/window 슬라이딩을 사용합니다.
+> N-CMAPSS LSTM은 43개 피처 · 대용량 데이터에 맞춰 **Huber Loss(δ=5.0)** 와 균등 sampling(P0 수정)을 사용합니다.
 > CWRU STFT는 raw 1D 대비 +3~7% 정확도 향상이 일반적입니다 (베어링 결함의 BPFI/BPFO 사이드밴드를 시간-주파수 평면에서 직접 학습).
 
-### 후처리 — AI4I CNN+GBDT 스태킹 앙상블
-
-`ai4i_cnn`과 `ai4i_gbdt`가 같은 실행에서 모두 성공하면, `main.py` 가 자동으로 **스태킹 앙상블** 평가를 추가합니다 (`ai4i_stack` 엔트리).
-
-- val set에서 `(w_cnn, threshold)` grid를 동시 탐색 → F1-best 채택
-- 가중치 grid: `[0.0, 0.1, …, 1.0]` 11개
-- 단일 CNN/GBDT 대비 F1 향상 여부가 리포트에 함께 기록됩니다.
+### 데이터셋별 권장 운영 명령
 
 ```bash
-python main.py --datasets ai4i_cnn ai4i_gbdt
-# → ai4i_cnn, ai4i_gbdt, ai4i_stack 3개 결과가 리포트에 누적
+# 가장 강력한 단일 모델만 학습/평가 (실무 운영 권장)
+python main.py --datasets ai4i_catboost cwru_cnn_stft hydraulic_ae ncmapss_lstm
+# → AI4I F1 0.893, CWRU Acc 1.000, Hydraulic F1 0.896, N-CMAPSS RMSE 8.96 (R² 0.868)
+
+# 앙상블 효과까지 검증 (CNN+GBDT+CatBoost 3-way, 멀티윈도우)
+python main.py --datasets ai4i_cnn ai4i_gbdt ai4i_catboost \
+                            cwru_cnn cwru_cnn_stft hydraulic_ae \
+                            cmapss_lstm cmapss_lstm_w20 cmapss_lstm_w50 \
+                            ncmapss_lstm
+# → 자동으로 ai4i_stack, cmapss_multiwindow_ensemble 후처리 평가까지 수행
 ```
+
+### 후처리 — AI4I n-way 스태킹 앙상블
+
+`ai4i_cnn`, `ai4i_gbdt`, `ai4i_catboost` 중 **2개 이상**이 같은 실행에서 성공하면, `main.py` 가 자동으로 **n-way 스태킹 앙상블** 평가를 추가합니다 (`ai4i_stack` 엔트리).
+
+- val set에서 **가중치 vector × threshold grid** 를 동시 탐색 → F1-best 채택
+- 모델별 가중치 grid: 각 0.0~1.0, step 0.1 (자동 정규화)
+- 단일 모델 vs 스태킹 F1 비교가 리포트에 기록됨
+
+**검증된 결과 (Phase 1):** 3-way 스태킹은 가중치가 `{CNN=0.00, GBDT=0.33, CatBoost=0.67}` 로 수렴하여 F1=0.885 산출 → **CatBoost 단독(0.893) 보다 약간 낮음**.
+→ **실무에선 CatBoost 단독 사용 권장**, 스태킹은 다양성 부족으로 효과 제한적.
+
+### 후처리 — C-MAPSS Multi-Window 앙상블
+
+`cmapss_lstm`, `cmapss_lstm_w20`, `cmapss_lstm_w50` 중 **2개 이상** 학습되면 자동으로 `cmapss_multiwindow_ensemble` 후처리가 실행됩니다.
+
+- **단순 평균**: 3개 모델의 예측 RUL을 산술 평균
+- **가중 평균**: val RMSE의 역수로 가중치 부여 (낮은 val RMSE 모델에 큰 비중)
+
+**검증된 결과:** Weighted ensemble이 단일 w=30 대비 **RMSE 13.48 → 13.37 (0.8% 개선)**, **MAE 10.04 → 9.71 (3% 개선)**.
+→ 운영자가 작은 향상도 추구할 때 유용, 학습 시간 3배 부담 감수 시.
 
 ---
 
@@ -312,7 +340,7 @@ Train Loss ↘ Val Loss ↗     → 과적합 시작! Early Stop 발동
 |------|-----------|
 | **딥러닝 코어** | PyTorch ≥ 2.0 |
 | **수치/데이터** | NumPy, Pandas, SciPy (.mat), h5py (.h5) |
-| **머신러닝 유틸** | scikit-learn (split / scaler / metrics / HistGBDT) |
+| **머신러닝 유틸** | scikit-learn (split / scaler / metrics / HistGBDT), **CatBoost** (tabular SOTA) |
 | **모델 해석** | Captum (Integrated Gradients) |
 | **시각화** | Matplotlib, tqdm |
 | **대시보드** | Streamlit ≥ 1.30 |

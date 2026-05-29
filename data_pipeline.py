@@ -499,6 +499,83 @@ def load_hydraulic_ae() -> Dict:
     }
 
 
+def load_hydraulic_lstm_ae() -> Dict:
+    """Hydraulic 시스템을 LSTM-AE 입력 (B, 60, 17)로 로드.
+
+    Dense AE 로더는 cycle당 평균값 1개로 압축했지만, 본 로더는 cycle 내
+    시간 정보를 보존한다. 모든 센서를 1Hz(60 timesteps)로 통일:
+      - 100Hz 센서 (PS1-6, EPS1): 100 샘플마다 평균 → 60 timesteps
+      - 10Hz  센서 (FS1-2)      : 10  샘플마다 평균 → 60 timesteps
+      - 1Hz   센서 (TS1-4, VS1, CE, CP, SE) : 그대로 사용 → 60 timesteps
+
+    출력 shape: (cycles, 60, 17). LSTM-AE 학습 입력으로 직접 사용.
+    StandardScaler는 train 정상 데이터로만 fit, 각 센서 채널별 통계.
+    """
+    root = config.DATASET_PATHS["hydraulic"]
+    if not root.exists():
+        raise FileNotFoundError(f"Hydraulic dataset not found: {root}")
+
+    SEQ_LEN = 60   # 1Hz로 통일된 timestep 수 (cycle 길이 60s)
+    sensor_arrays = []
+    for s in HYDRAULIC_SENSORS:
+        fp = root / f"{s}.txt"
+        if not fp.exists():
+            raise FileNotFoundError(f"Hydraulic sensor file missing: {fp}")
+        arr = np.loadtxt(fp)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        # 다운샘플: 행은 그대로(cycles), 열을 SEQ_LEN으로 평균 압축
+        n_cycles, n_per_cycle = arr.shape
+        if n_per_cycle == SEQ_LEN:
+            ds = arr.astype(np.float32)
+        elif n_per_cycle % SEQ_LEN == 0:
+            factor = n_per_cycle // SEQ_LEN
+            # (cycles, SEQ_LEN, factor) → 마지막 축 평균
+            ds = arr.reshape(n_cycles, SEQ_LEN, factor).mean(axis=2).astype(np.float32)
+        else:
+            raise RuntimeError(
+                f"Hydraulic sensor {s}: samples_per_cycle={n_per_cycle} 가 "
+                f"SEQ_LEN={SEQ_LEN}의 배수가 아닙니다."
+            )
+        sensor_arrays.append(ds)
+    # 센서들을 채널 축으로 결합: (cycles, SEQ_LEN, n_sensors)
+    X = np.stack(sensor_arrays, axis=2).astype(np.float32)
+    assert X.shape == (2205, SEQ_LEN, len(HYDRAULIC_SENSORS)), \
+        f"unexpected shape {X.shape}"
+
+    # 라벨: stable_flag (동일 로직)
+    profile = np.loadtxt(root / "profile.txt", dtype=int)
+    if profile.ndim != 2 or profile.shape[1] < 5:
+        raise RuntimeError(
+            f"Hydraulic profile.txt unexpected shape {profile.shape}"
+        )
+    stable_flag = profile[:, 4]
+    y = (stable_flag == 0).astype(np.float32)
+
+    # split
+    X_tr, y_tr, X_va, y_va, X_te, y_te = _split_train_val_test(X, y, stratify=y)
+
+    # 정상-only train + 채널별 StandardScaler (시간×피처 통계)
+    normal_mask = y_tr == 0
+    if not normal_mask.any():
+        raise RuntimeError("Hydraulic train split has no normal samples")
+    _, (X_tr_n, X_va, X_te) = _scale_seq(X_tr[normal_mask], X_va, X_te)
+
+    return {
+        "X_train": X_tr_n,
+        "y_train": np.zeros(len(X_tr_n), dtype=np.float32),
+        "X_val":   X_va, "y_val": y_va,
+        "X_test":  X_te, "y_test": y_te,
+        "meta": {
+            "name": "Hydraulic-LSTM-AE",
+            "task": "anomaly_detection",
+            "seq_len": SEQ_LEN,
+            "n_features": len(HYDRAULIC_SENSORS),
+            "feature_names": list(HYDRAULIC_SENSORS),
+        },
+    }
+
+
 # ===========================================================================
 # 4) C-MAPSS - LSTM RUL (B, 14, 30) (PRD: B,C,L 채널 우선)
 # ===========================================================================
@@ -541,11 +618,14 @@ def _build_rul_windows(
     return np.stack(Xs), np.array(ys, dtype=np.float32)
 
 
-def load_cmapss_lstm(subset: str = "FD001") -> Dict:
-    """C-MAPSS FD001을 LSTM 입력 (B, 14, 30)로 로드.
+def load_cmapss_lstm(subset: str = "FD001", window: Optional[int] = None) -> Dict:
+    """C-MAPSS FD001을 LSTM 입력 (B, 14, window)로 로드.
 
     엔진 단위로 train/val 분할(데이터 누수 방지). test set은 별도 파일과
     RUL_*.txt에서 로드하며, 각 엔진의 마지막 window만 평가에 사용한다.
+
+    window 파라미터로 sliding window 길이를 명시 가능 (Multi-Window Ensemble용).
+    None이면 config.LSTM_CFG["window"] (기본 30) 사용.
     """
     root = config.DATASET_PATHS["cmapss"]
     train_fp = root / f"train_{subset}.txt"
@@ -558,7 +638,8 @@ def load_cmapss_lstm(subset: str = "FD001") -> Dict:
     test_df  = pd.read_csv(test_fp,  sep=r"\s+", header=None, names=CMAPSS_COLS)
     rul_test = np.loadtxt(rul_fp, dtype=np.float32)
 
-    window = config.LSTM_CFG["window"]
+    if window is None:
+        window = config.LSTM_CFG["window"]
     rul_clip = config.LSTM_CFG["rul_clip"]
 
     # 엔진 단위 train/val split (random 80/20) - 누수 방지
@@ -685,8 +766,15 @@ def load_ncmapss_lstm(file_name: str = "N-CMAPSS_DS01-005.h5",
         test_X, test_Y, test_U = _stack("test")
 
     def _windows_per_unit(X, Y, U, max_units, max_per_unit):
-        """unit별로 stride 다운샘플링 후 슬라이딩 윈도우 추출."""
+        """unit별로 stride 다운샘플링 후 슬라이딩 윈도우 추출.
+
+        수정 (P0): 기존에는 각 unit의 처음 max_per_unit개만 취해 RUL 분포가
+        엔진 수명 초기 구간(고 RUL)에 편향됐다 (Y_test std 24.5 → 4.45로 압축).
+        이제 unit timeline 전체에서 **균등 sampling** 하여 [0, max_RUL] 전체
+        구간을 대표하도록 한다.
+        """
         units = np.unique(U)[:max_units]
+        rng = np.random.default_rng(config.SEED)
         Xs, Ys = [], []
         for u in units:
             mask = U == u
@@ -694,8 +782,15 @@ def load_ncmapss_lstm(file_name: str = "N-CMAPSS_DS01-005.h5",
             y_u = Y[mask][::stride]
             if len(x_u) < window:
                 continue
-            n_win = min(len(x_u) - window + 1, max_per_unit)
-            for i in range(n_win):
+            total_windows = len(x_u) - window + 1
+            if total_windows <= max_per_unit:
+                # 가능한 모든 window 사용
+                indices = np.arange(total_windows)
+            else:
+                # 균등 sampling: linspace 로 timeline 전체를 대표
+                indices = np.linspace(0, total_windows - 1, max_per_unit,
+                                       dtype=np.int64)
+            for i in indices:
                 Xs.append(x_u[i:i + window])
                 Ys.append(min(rul_clip, y_u[i + window - 1]))
         if not Xs:
@@ -757,9 +852,14 @@ LOADERS = {
     "ai4i_cnn":      load_ai4i_cnn,
     "ai4i_ae":       load_ai4i_ae,        # legacy 비교용 (PIPELINE에서는 제외)
     "ai4i_gbdt":     load_ai4i_gbdt,
+    "ai4i_catboost": load_ai4i_gbdt,      # CatBoost도 동일 tabular 입력 사용
     "cwru_cnn":      load_cwru_cnn,
     "cwru_cnn_stft": load_cwru_cnn_stft,
     "hydraulic_ae":  load_hydraulic_ae,
+    "hydraulic_lstm_ae": load_hydraulic_lstm_ae,
     "cmapss_lstm":   load_cmapss_lstm,
+    # Multi-Window Ensemble용 변형 (window=20, 50). 기본 cmapss_lstm은 window=30.
+    "cmapss_lstm_w20": lambda: load_cmapss_lstm(window=20),
+    "cmapss_lstm_w50": lambda: load_cmapss_lstm(window=50),
     "ncmapss_lstm":  load_ncmapss_lstm,
 }

@@ -493,6 +493,127 @@ class DenoisingAE(nn.Module):
 
 
 # ===========================================================================
+# 2-bis) LSTM Autoencoder (시계열 이상 탐지 - Hydraulic 등)
+# ===========================================================================
+
+class LSTMAutoencoder(nn.Module):
+    """시계열 다변량 센서 데이터용 LSTM Autoencoder.
+
+    Dense AE 대비 차별점:
+      - 입력이 (B, L, F) 3D — cycle 내 시간 패턴(예: 압력 spike 위치)을 학습
+      - Encoder: BiLSTM → final hidden을 latent로 압축
+      - Decoder: latent를 seq_len만큼 broadcast 후 LSTM으로 재생성
+      - Hydraulic 같이 cycle 내 시계열 정보가 결함과 연관된 경우 +3~5% F1 기대
+
+    인터페이스는 DenoisingAE와 호환되도록 설계:
+      - reconstruction_error(x) → (B,) per-sample MSE
+      - fit_threshold(normal_data), set_threshold(value)
+      - predict(x), anomaly_score(x)
+    """
+    def __init__(self, n_features: int, seq_len: int,
+                 hidden_dim: int = 64, latent_dim: int = 16,
+                 num_layers: int = 1, noise_std: float = 0.02):
+        super().__init__()
+        self.n_features = n_features
+        self.seq_len = seq_len
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.noise_std = noise_std
+
+        # Encoder: BiLSTM → 마지막 hidden state → latent
+        self.encoder_lstm = nn.LSTM(
+            input_size=n_features, hidden_size=hidden_dim,
+            num_layers=num_layers, batch_first=True, bidirectional=True,
+        )
+        # BiLSTM output dim = hidden_dim * 2
+        self.encoder_proj = nn.Linear(hidden_dim * 2, latent_dim)
+
+        # Decoder: latent → broadcast → LSTM → linear to n_features
+        self.decoder_lstm = nn.LSTM(
+            input_size=latent_dim, hidden_size=hidden_dim,
+            num_layers=num_layers, batch_first=True, bidirectional=False,
+        )
+        self.decoder_out = nn.Linear(hidden_dim, n_features)
+
+        # threshold buffer (state_dict 함께 저장)
+        self.register_buffer("threshold", torch.tensor(float("inf")))
+
+    def _ensure_threshold_set(self):
+        if torch.isinf(self.threshold).item():
+            raise RuntimeError(
+                "LSTMAutoencoder.threshold is not initialized. "
+                "Call model.fit_threshold(normal_train_tensor) after training."
+            )
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L, F)
+        out, (h_n, _) = self.encoder_lstm(x)
+        # BiLSTM: h_n shape (2*num_layers, B, H). 마지막 layer의 forward+backward 결합.
+        # 대신 sequence 평균을 latent로 사용 (더 robust)
+        pooled = out.mean(dim=1)        # (B, 2H)
+        z = self.encoder_proj(pooled)   # (B, latent_dim)
+        return z
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        # z: (B, latent_dim) → seq_len 만큼 broadcast → (B, L, latent_dim)
+        z_seq = z.unsqueeze(1).repeat(1, self.seq_len, 1)
+        out, _ = self.decoder_lstm(z_seq)              # (B, L, H)
+        recon = self.decoder_out(out)                  # (B, L, F)
+        return recon
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 학습 모드일 때만 noise 주입
+        if self.training and self.noise_std > 0:
+            x_in = x + torch.randn_like(x) * self.noise_std
+        else:
+            x_in = x
+        z = self.encode(x_in)
+        return self.decode(z)
+
+    def reconstruction_error(self, x: torch.Tensor) -> torch.Tensor:
+        """샘플별 MSE 재구성 오차 (B,). 시간·피처 차원 모두 평균."""
+        recon = self.forward(x)
+        # (B, L, F) → (B,) 평균
+        return ((recon - x) ** 2).mean(dim=(1, 2))
+
+    @torch.no_grad()
+    def fit_threshold(self, normal_data: torch.Tensor,
+                      percentile: float = 95.0,
+                      batch_size: int = 64) -> float:
+        self.eval()
+        device = self.threshold.device
+        n = normal_data.shape[0]
+        if n == 0:
+            raise ValueError("fit_threshold received empty normal_data")
+        errs = []
+        for i in range(0, n, batch_size):
+            chunk = normal_data[i:i + batch_size].to(device)
+            errs.append(self.reconstruction_error(chunk).cpu().numpy())
+        errs = np.concatenate(errs)
+        thr = float(np.percentile(errs, percentile))
+        self.threshold = torch.tensor(thr, dtype=torch.float32, device=device)
+        return thr
+
+    def set_threshold(self, value: float) -> None:
+        self.threshold = torch.tensor(
+            float(value), dtype=torch.float32, device=self.threshold.device,
+        )
+
+    @torch.no_grad()
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        self._ensure_threshold_set()
+        err = self.reconstruction_error(x)
+        return (err > self.threshold).float()
+
+    @torch.no_grad()
+    def anomaly_score(self, x: torch.Tensor) -> torch.Tensor:
+        """[0, 1] 정규화된 이상 점수. err / (err + threshold) 형태."""
+        self._ensure_threshold_set()
+        err = self.reconstruction_error(x)
+        return err / (err + self.threshold + 1e-8)
+
+
+# ===========================================================================
 # 3) BiLSTM + Self-Attention Pooling (RUL 회귀)
 # ===========================================================================
 
@@ -582,7 +703,7 @@ class BiLSTMRegressor(nn.Module):
 # 모델 팩토리
 # ===========================================================================
 
-ARCHS = ("cnn_vibration", "cnn_vibration_stft", "cnn_tabular", "ae", "lstm")
+ARCHS = ("cnn_vibration", "cnn_vibration_stft", "cnn_tabular", "ae", "lstm_ae", "lstm")
 
 
 def build_model(arch: str, **kwargs) -> nn.Module:
@@ -592,7 +713,8 @@ def build_model(arch: str, **kwargs) -> nn.Module:
       "cnn_vibration"      : WDCNN1D       (CWRU raw 1D 진동 신호)
       "cnn_vibration_stft" : STFTCNN2D     (CWRU STFT 스펙트로그램)
       "cnn_tabular"        : TabularCNN1D  (AI4I 등 짧은 테이블)
-      "ae"                 : DenoisingAE
+      "ae"                 : DenoisingAE   (Hydraulic cycle 평균 등)
+      "lstm_ae"            : LSTMAutoencoder (Hydraulic cycle 내 시계열)
       "lstm"               : BiLSTMRegressor
 
     오타 방어: 알려지지 않은 arch는 difflib로 가까운 후보를 추천한다.
@@ -612,5 +734,7 @@ def build_model(arch: str, **kwargs) -> nn.Module:
         return TabularCNN1D(**kwargs)
     if arch == "ae":
         return DenoisingAE(**kwargs)
+    if arch == "lstm_ae":
+        return LSTMAutoencoder(**kwargs)
     # arch == "lstm"
     return BiLSTMRegressor(**kwargs)

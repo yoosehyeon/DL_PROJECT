@@ -35,12 +35,17 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 # ── 데이터셋 카탈로그 ────────────────────────────────────────────
 DATASETS: dict[str, dict] = {
-    "ai4i_cnn":     {"label": "AI4I — CNN (고장 분류)",        "task": "binary_cls",  "ext": ".pt"},
-    "ai4i_gbdt":    {"label": "AI4I — GBDT (고장 분류)",       "task": "gbdt",        "ext": ".pkl"},
-    "cwru_cnn":     {"label": "CWRU — CNN (베어링 결함 분류)", "task": "multi_cls",   "ext": ".pt"},
-    "hydraulic_ae": {"label": "Hydraulic — AE (이상 감지)",     "task": "anomaly",     "ext": ".pt"},
-    "cmapss_lstm":  {"label": "C-MAPSS — LSTM (남은 수명 예측)","task": "regression",  "ext": ".pt"},
-    "ncmapss_lstm": {"label": "N-CMAPSS — LSTM (남은 수명 예측)","task": "regression", "ext": ".pt"},
+    "ai4i_cnn":          {"label": "AI4I — CNN (고장 분류)",                 "task": "binary_cls",  "ext": ".pt"},
+    "ai4i_gbdt":         {"label": "AI4I — HistGradient (고장 분류)",         "task": "gbdt",        "ext": ".pkl"},
+    "ai4i_catboost":     {"label": "AI4I — CatBoost (권장 단일 모델) ★",      "task": "gbdt",        "ext": ".pkl"},
+    "cwru_cnn":          {"label": "CWRU — CNN raw 1D (베어링 결함 분류)",    "task": "multi_cls",   "ext": ".pt"},
+    "cwru_cnn_stft":     {"label": "CWRU — STFT 2D-CNN (베어링 결함 분류) ★", "task": "multi_cls",   "ext": ".pt"},
+    "hydraulic_ae":      {"label": "Hydraulic — Dense AE (이상 감지) ★",      "task": "anomaly",     "ext": ".pt"},
+    "hydraulic_lstm_ae": {"label": "Hydraulic — LSTM AE (실험적)",           "task": "anomaly",     "ext": ".pt"},
+    "cmapss_lstm":       {"label": "C-MAPSS — BiLSTM window=30 (남은 수명)",  "task": "regression",  "ext": ".pt"},
+    "cmapss_lstm_w20":   {"label": "C-MAPSS — BiLSTM window=20",            "task": "regression",  "ext": ".pt"},
+    "cmapss_lstm_w50":   {"label": "C-MAPSS — BiLSTM window=50",            "task": "regression",  "ext": ".pt"},
+    "ncmapss_lstm":      {"label": "N-CMAPSS — BiLSTM (실제 비행 조건) ★",    "task": "regression",  "ext": ".pt"},
 }
 
 EVAL_TASK_MAP = {
